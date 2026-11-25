@@ -40,14 +40,18 @@ sources:
     resource: repo://src/generation/repository-run.ts
   - id: openwiki-source-c6189f89b3f67d0cbf87739f
     resource: repo://src/ingestion/ingestion.ts
+  - id: openwiki-source-ada7fcb0bef11e183302d637
+    resource: repo://src/integrations/core/begin-view.ts
   - id: openwiki-source-410e7efbe6dee8c4d43e9b4d
     resource: repo://src/integrations/core/protocol.ts
   - id: openwiki-source-58835b77ce38a0dd1fed8d09
     resource: repo://src/integrations/core/session-manager.ts
-generated: { by: "openwiki/0.5.2", at: "2026-09-23T08:09:37.122Z" }
+  - id: openwiki-source-c194ba7f94bf86a83012a7b4
+    resource: repo://src/integrations/install/registry.ts
+generated: { by: "openwiki/0.9.0", at: "2026-11-06T08:06:02.348Z" }
 verified:
-  - by: openwiki/0.5.2
-    at: 2026-09-23T08:09:37.122Z
+  - by: openwiki/0.9.0
+    at: 2026-11-06T08:06:02.348Z
 ---
 
 # Architecture Overview
@@ -73,11 +77,11 @@ selects the personal brain. See [Two modes](../concepts/two-modes.md).
 **Driver** decides which model and tools do the authoring. In _native_
 generation, OpenWiki resolves a configured provider, builds its own chat model,
 and runs its own DeepAgents workers. In _host-driven_ generation, a coding agent
-(Codex, Claude Code, OpenCode, Cursor, IBM Bob / Bob Shell, Kiro, Oh My Pi, or
-Antigravity) uses its own authenticated model and native repository tools, while
-OpenWiki exposes the durable page-job lifecycle over MCP and owns validation
-and finalization. Host-driven runs currently support only repository code wikis,
-not personal brains.
+(Codex, Claude Code, OpenCode, Cursor, IBM Bob, Kiro, Oh My Pi, Antigravity
+CLI, or GitHub Copilot CLI) uses its own authenticated model and native
+repository tools, while OpenWiki exposes the durable page-job lifecycle over
+MCP and owns validation and finalization. Host-driven runs currently support
+only repository code wikis, not personal brains.
 
 ```mermaid
 flowchart TD
@@ -101,10 +105,12 @@ flowchart TD
   Slot1 --> Snapshot["snapshot pending page and Claims"]
   Slot2 --> Snapshot
   Snapshot --> PageWorker["fresh page worker"]
-  PageWorker -->|"fails or exits without submit"| Skip["skipRepositoryPage restores snapshot, marks skipped, lowers live limit on rate limit"]
+  PageWorker -->|"submit_page"| Lifecycle
+  PageWorker -->|"fails or exits without submit"| Retry["restoreRepositoryPage resets to snapshot"]
+  Retry -->|"attempt under PAGE_WORKER_ATTEMPT_LIMIT"| PageWorker
+  Retry -->|"attempt budget exhausted"| Skip["skipRepositoryPage restores snapshot, marks skipped, lowers live limit on rate limit"]
   Skip --> Pool
   PageWorker -->|"inspect_claims on demand"| Lifecycle
-  PageWorker -->|"submit_page sparse Claim decisions"| Lifecycle
   Pool -->|"all drained (quickstart held back to last)"| Finalize["finishRepositoryRun restores skipped pages and finalizes"]
   Finalize -->|"source drift at finish"| Report["runner reports drift, returns sourceChanged=true"]
   Report --> LaterUpdate["next --update resumes and invalidates the plan"]
@@ -139,20 +145,24 @@ sequenceDiagram
     Driver->>Run: submit_page (sparse Claim decisions)
     Run->>Queue: persist Markdown + Claims + page-manifest (durable boundary)
     alt worker fails / no submit
-      Driver->>Run: skipRepositoryPage
+      Driver->>Run: restoreRepositoryPage (reset to snapshot)
+      Run->>Queue: retry up to PAGE_WORKER_ATTEMPT_LIMIT
+      Driver->>Run: skipRepositoryPage (attempt budget exhausted)
       Run->>Queue: restore snapshot, mark skipped
     end
   end
   Driver->>Run: finish (finalize-once)
-  Run->>Run: restore skipped pages, finalize Claims excluding them
+  Run->>Run: restore skipped pages, finalize Claims excluding skipped + deferred-claim pages
   Run->>Run: re-check source fingerprint at both ends
   Run-->>Driver: { status: complete, sourceChanged? }
 ```
 
 Caption: The `begin → submit_plan → next_page → submit_page → finish`
 lifecycle. `finish` is a single deterministic finalization; it refuses to run
-while any page job is still `pending`, restores skipped pages' Markdown, and
-persists `interrupted` metadata when pages were skipped or source drifted.
+while any page job is still `pending`, restores skipped pages' Markdown,
+excludes skipped and deferred-claim pages from Claim finalization, and
+persists `interrupted` metadata when pages were skipped, deferred, or source
+drifted.
 
 ## CLI entrypoint
 
@@ -235,19 +245,40 @@ the run never finalizes with pending jobs. If a worker fails on a provider
 rate limit, the live pool size is lowered by one (never below 1) and a notice
 is emitted; other skip causes keep the pool size.
 
+**Tracing.** Every planner and page worker in one repository run shares a single
+LangSmith thread id from `resolveTraceThreadId(runId)` — the durable `runId` by
+default, overridable via `OPENWIKI_TRACE_THREAD_ID` — passed as
+`configurable.thread_id` to each agent stream. The agents are also named
+(`PLANNER_AGENT_NAME`, `"planning agent"`; `workerAgentName(page)`,
+`"worker agent: <page>"`) so the run groups as one planner plus one worker per
+page in LangSmith. Detail lives in [Agent runtime](agent-runtime.md).
+
 The lifecycle is resumable and self-correcting. Before a page worker runs, its
 pending page and Claims sidecar are snapshotted (`captureRepositoryPageSnapshot`).
-If the worker fails or exits without submitting, `skipRepositoryPage` restores
-the page and Claims from that snapshot, marks the job `skipped`, and the run
-continues with the next page rather than aborting; the page is reconsidered on a
-later update. `runPendingPageAgents` collects every skipped-page snapshot and
-passes them to `finishRepositoryRun`, which restores the skipped pages' Markdown
-after finalization, finalizes Claims with those pages excluded, and persists
-`interrupted` update metadata so the run is honestly recorded as partial.
-Page restore and the planned/abandoned-page deletions at finish tolerate a
-human-readable "not found" backend error instead of aborting the run, so a
-page that never existed or was already removed is treated as already restored
-or deleted.
+`runPageAgent` runs a fresh bounded worker per attempt and retries a worker that
+exits without submitting up to `PAGE_WORKER_ATTEMPT_LIMIT` (2) times: a failed
+attempt is reset to the pre-run snapshot with `restoreRepositoryPage` before the
+retry, and only after the attempt budget is exhausted (or a provider rate-limit
+error short-circuits the retry) does `skipRepositoryPage` restore the snapshot
+under the run mutation lock, mark the job `skipped`, and let the run continue
+with the next page rather than aborting; the page is reconsidered on a later
+update. A fatal submission failure (the store refusing the page) is not retried
+and is rethrown so the run stops rather than looping on an unfixable error.
+`runPendingPageAgents` collects every skipped-page snapshot and passes them to
+`finishRepositoryRun`. A focused update may defer unrelated stale Claim pages
+by passing `deferUnplannedClaimIssues` to `submit_plan`; the planner records
+those deferred-claim pages on the plan and leaves them untouched for a later
+full update. `finishRepositoryRun` restores the skipped pages' Markdown after
+finalization and finalizes Claims excluding both skipped pages and
+deferred-claim pages, so neither is restamped as complete by this run; it
+persists `interrupted` update metadata so the run is honestly recorded as
+partial. The same exclusion applies per page during generation:
+`submitRepositoryPage` finalizes the submitting page's Claims while excluding
+every other pending page plus the deferred-claim pages, so a concurrent worker
+mid-edit on another page never records transient bytes there. Page restore and
+the planned/abandoned-page deletions at finish tolerate a human-readable "not
+found" backend error instead of aborting the run, so a page that never existed
+or was already removed is treated as already restored or deleted.
 
 If finalization detects that repository source drifted underneath the plan,
 the run does not abort or auto-replan. `finishRepositoryRun` re-checks the
@@ -277,7 +308,17 @@ match, plus a single-operation guard that rejects overlapping lifecycle calls.
 `openwiki_begin` rejects an unrecognized `language` with `invalid_input`
 instead of starting a run (delegating to the same `beginRepositoryRun`
 language check), so the caller can correct the code and retry with nothing to
-clean up. `openwiki_inspect_page_claims` returns the current pending page's
+clean up. Because a host transport cannot assume unbounded result payloads,
+the adapter bounds the begin view it returns through `toHostActiveBeginView`:
+the top-level `changedPaths` and per-window path lists are capped
+(`HOST_BEGIN_PATH_LIMIT` of 200 paths, shared across update windows), and the
+`claimIssues` list is capped at `HOST_BEGIN_CLAIM_ISSUE_LIMIT` (50). Totals
+stay exact — `changedPathCount`/`claimIssueCount` report the real lengths and
+`changedPathsTruncated`/`claimIssuesTruncated` flag omissions — and a
+`claimIssuePages` list names every page with a Claims issue even when its
+issues were truncated. No work is lost: omitted changed paths come from the
+host's own Git, and each page's full Claims return from `openwiki_next_page`.
+`openwiki_inspect_page_claims` returns the current pending page's
 complete Claim set on demand for broad rewrites; `openwiki_next_page` returns
 only `existingClaimCount` and the stale or unresolved Claims requiring an
 explicit decision, so focused updates stay compact. `openwiki_finish` is the

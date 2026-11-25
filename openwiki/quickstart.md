@@ -4,6 +4,8 @@ title: OpenWiki Quickstart
 description: Entry-point orientation for a coding agent working on the OpenWiki CLI codebase, with a task-routing map into the architecture, workflow, concept, operations, integration, and testing pages.
 tags: [openwiki, quickstart, cli, orientation, task-routing, deepagents]
 sources:
+  - id: openwiki-source-fe40bdf5ac5a95cc1c252b13
+    resource: repo://.changeset/openrouter-base-url.md
   - id: openwiki-source-f317ee207e1653d2033c81a4
     resource: repo://CONTRIBUTING.md
   - id: openwiki-source-c45a528335f5cf7306567dc9
@@ -14,6 +16,8 @@ sources:
     resource: repo://package.json
   - id: openwiki-source-23775c3de52f3ab95a13cb8b
     resource: repo://README.md
+  - id: openwiki-source-a953060a04ccefcf777de48e
+    resource: repo://src/agent/index.ts
   - id: openwiki-source-6cb3236b8c1412a26d832fcf
     resource: repo://src/agent/repository-runner.ts
   - id: openwiki-source-69abc6f0f641147820a274bc
@@ -26,20 +30,28 @@ sources:
     resource: repo://src/cli/commands.ts
   - id: openwiki-source-278e7e180eac811fc1a24f7a
     resource: repo://src/config/constants.ts
+  - id: openwiki-source-c2770ac037a7f4b0116a0dc5
+    resource: repo://src/config/env.ts
+  - id: openwiki-source-1197594de038075f3570340c
+    resource: repo://src/generation/page-jobs.ts
   - id: openwiki-source-7c5ecb56558cc061dab24f9d
     resource: repo://src/generation/repository-run.ts
   - id: openwiki-source-080c4525024a9b689e361cbb
     resource: repo://src/generation/run-state.ts
+  - id: openwiki-source-ada7fcb0bef11e183302d637
+    resource: repo://src/integrations/core/begin-view.ts
   - id: openwiki-source-410e7efbe6dee8c4d43e9b4d
     resource: repo://src/integrations/core/protocol.ts
+  - id: openwiki-source-58835b77ce38a0dd1fed8d09
+    resource: repo://src/integrations/core/session-manager.ts
   - id: openwiki-source-c194ba7f94bf86a83012a7b4
     resource: repo://src/integrations/install/registry.ts
   - id: openwiki-source-349c953869b025f9d4935470
     resource: repo://src/platform/language.ts
-generated: { by: "openwiki/0.5.2", at: "2026-09-23T08:09:37.122Z" }
+generated: { by: "openwiki/0.9.0", at: "2026-11-11T08:06:00.631Z" }
 verified:
-  - by: openwiki/0.5.2
-    at: 2026-09-23T08:09:37.122Z
+  - by: openwiki/0.9.0
+    at: 2026-11-11T08:06:00.631Z
 ---
 
 # OpenWiki Quickstart
@@ -55,12 +67,13 @@ matches your task. Read this first, then follow the links below.
 
 ## What OpenWiki is
 
-OpenWiki is published as the `openwiki` npm package (v0.5.2), a Node.js
+OpenWiki is published as the `openwiki` npm package (v0.9.0), a Node.js
 (>=22.22.0) CLI whose binary resolves to `dist/cli/cli.js`. Its purpose, per the
 package manifest, is "a CLI that uses a DeepAgents documentation agent to
 generate and maintain an OpenWiki for a codebase." The runtime is a DeepAgents
-documentation agent driven by one of fourteen model providers, wrapped by a CLI
-that can run interactively (an Ink TUI) or one-shot (print mode).
+documentation agent driven by one of fifteen model providers (including
+Mistral alongside the other API-key providers), wrapped by a CLI that can run
+interactively (an Ink TUI) or one-shot (print mode).
 
 The CLI has two operating modes:
 
@@ -75,16 +88,23 @@ OpenWiki is a pnpm + TypeScript project. The commands you will use most:
 
 ```sh
 pnpm install          # install dependencies
-pnpm run build        # tsc (server + client) then copy visualizer assets
+pnpm run build        # typescript7 tsc -p tsconfig.json + tsconfig.client.json, then copy visualizer assets
+pnpm run typecheck    # typescript7 tsc --noEmit for both server and client projects
 pnpm run dev          # run the CLI from source via tsx (src/cli/cli.tsx)
-pnpm run coverage     # run the Vitest suite with coverage
+pnpm run coverage     # vitest run --coverage
 pnpm test             # typecheck + build + coverage (the full CI-equivalent gate)
 ```
 
+The `build` script compiles the server project (`tsconfig.json`) and client
+project (`tsconfig.client.json`) with the `typescript7` compiler binary
+(`node ./node_modules/typescript7/bin/tsc`) and then copies visualizer assets
+via `scripts/copy-visualize-assets.cjs`. `typecheck` runs the same binary in
+`--noEmit` mode against both projects. `test` chains `pnpm run typecheck &&
+pnpm run build && pnpm run coverage`, so it is the full CI-equivalent gate.
 `pnpm run dev` executes the TypeScript entrypoint directly with `tsx`, while the
-shipped binary runs the compiled `dist/cli/cli.js`. Before opening a PR, run
-`pnpm run format`, `pnpm run lint`, and `pnpm test`; `format` and `lint` mirror
-the per-PR checks and `test` typechecks, builds, and runs Vitest with coverage.
+shipped `openwiki` binary and `start` script run the compiled `dist/cli/cli.js`.
+Before opening a PR, run `pnpm run format`, `pnpm run lint`, and `pnpm test`;
+`format` and `lint` mirror the per-PR checks.
 
 To exercise the CLI against another local repository, link the package globally
 (`pnpm link --global`) or alias `openwiki` to `node /path/to/openwiki/dist/cli/cli.js`,
@@ -140,7 +160,7 @@ between `pnpm run dev` and the built binary.
 > `unrecognized` result, returns an `error` command with the user-facing
 > message before any run work or persisted state is touched. The full command
 > and flag reference lives in
-> [CLI Reference](/openwiki/operations/cli-reference.md).
+> [CLI Reference](./operations/cli-reference.md).
 
 ## Task-routing map
 
@@ -151,49 +171,53 @@ the canonical wiki pages; each one links into the deeper source map.
 
 | I want to…                                                                                                          | Read                                                        |
 | ------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| Get the top-level picture of how the CLI, agent, modes, resumable generation, Claims, finalization, connectors, and the visualizer fit together | [Architecture Overview](/openwiki/architecture/overview.md) |
-| Find which subsystem lives where under `/src`                                                                       | [Source Map](/openwiki/architecture/source-map.md)          |
+| Get the top-level picture of how the CLI, agent, modes, resumable generation, Claims, finalization, connectors, and the visualizer fit together | [Architecture Overview](./architecture/overview.md) |
+| Understand the agent runtime: model provider resolution, the DeepAgents graph, the sandboxed docs-only filesystem, middleware, stream parsing, and the native repository runner's planner and page workers | [Agent Runtime, Models, and Middleware](./architecture/agent-runtime.md) |
+| Find which subsystem lives where under `/src`                                                                       | [Source Map](./architecture/source-map.md)          |
 
 ### Learn the core concepts
 
 | I want to…                                                                        | Read                                                                 |
 | --------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| Understand grounded Claims: material facts tied to versioned repository evidence   | [Grounded Claims](/openwiki/concepts/grounded-claims.md)             |
-| See what OKF output looks like (frontmatter, provenance, validated Mermaid)        | [Open Knowledge Format Output](/openwiki/concepts/okf-output.md)     |
+| Understand grounded Claims: material facts tied to versioned repository evidence   | [Grounded Claims](./concepts/grounded-claims.md)             |
+| See what OKF output looks like (frontmatter, provenance, validated Mermaid)        | [Open Knowledge Format Output](./concepts/okf-output.md)     |
+| Look up supported model providers, their env keys, base URLs, auth methods (API keys, OAuth, AWS SDK, external CLI, IBM Bob, Entra ID), and credentials | [Model Providers and Credentials](./concepts/model-providers.md) |
 
 ### Follow a workflow end to end
 
 | I want to…                                                                                                              | Read                                                                  |
 | ----------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| Set up OpenWiki for the first time (provider/model, credentials, repo setup)                                            | [First-Run Onboarding](/openwiki/workflows/onboarding.md)             |
-| Trace the resumable page-job generation flow (`begin → submit_plan → next_page → submit_page → finish`, with on-demand `inspect_page_claims`)                  | [Repository Generation Lifecycle](/openwiki/workflows/repository-generation.md) |
-| Understand how a failing or early-exiting page worker is skipped and restored without losing completed pages            | [Repository Generation Lifecycle](/openwiki/workflows/repository-generation.md) |
-| Understand how repository source drift during a run is detected and why the run finalizes without advancing the source checkpoint | [Repository Generation Lifecycle](/openwiki/workflows/repository-generation.md) |
-| Understand how Claims are reconciled on update and how a page submits sparse Claim decisions (`confirmedClaimIds` / `claims` / `retractedClaimIds`) with issue-free Claims retained automatically and full Claims available via on-demand inspect | [Claims Reconciliation](/openwiki/workflows/claims-reconciliation.md) |
-| Understand deterministic finalize-once finalization, index/provenance sync, link validation, and skipped-page restore on finish | [Wiki Finalization Workflow](/openwiki/workflows/wiki-finalization.md) |
+| Set up OpenWiki for the first time (provider/model, credentials, repo setup)                                            | [First-Run Onboarding](./workflows/onboarding.md)             |
+| Trace the resumable page-job generation flow (`begin → submit_plan → next_page → submit_page → finish`, with on-demand `inspect_page_claims`)                  | [Repository Generation Lifecycle](./workflows/repository-generation.md) |
+| Understand repository-run tracing: how one planner and one page worker per page share a single LangSmith thread named "planning agent" and "worker agent: <page>", resolved from `OPENWIKI_TRACE_THREAD_ID` or the durable run id | [Agent Runtime, Models, and Middleware](./architecture/agent-runtime.md) and [Repository Generation Lifecycle](./workflows/repository-generation.md) |
+| Understand how a failing or early-exiting page worker is skipped and restored without losing completed pages            | [Repository Generation Lifecycle](./workflows/repository-generation.md) |
+| Understand how repository source drift during a run is detected and why the run finalizes without advancing the source checkpoint | [Repository Generation Lifecycle](./workflows/repository-generation.md) |
+| Understand how Claims are reconciled on update and how a page submits sparse Claim decisions (`confirmedClaimIds` / `claims` / `retractedClaimIds`) with issue-free Claims retained automatically and full Claims available via on-demand inspect | [Claims Reconciliation](./workflows/claims-reconciliation.md) |
+| Understand deterministic finalize-once finalization, index/provenance sync, link validation, and skipped-page restore on finish | [Wiki Finalization Workflow](./workflows/wiki-finalization.md) |
 
 ### Operate and configure it
 
 | I want to…                                                                                   | Read                                                         |
 | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
-| Look up CLI commands and flags (init/update, mode, print, integrations, visualize, schedule) | [CLI Reference](/openwiki/operations/cli-reference.md)        |
-| Understand environment loading, the `~/.openwiki` state directory, provider/token/reasoning settings, and secret sanitization | [Configuration and Environment](/openwiki/operations/configuration.md) |
-| Set up scheduled self-update in CI and the docs-PR workflow                                  | [CI Scheduling and Self-Update](/openwiki/operations/ci-scheduling.md) |
+| Look up CLI commands and flags (init/update, mode, print, integrations, visualize, schedule) | [CLI Reference](./operations/cli-reference.md)        |
+| Understand environment loading, the `~/.openwiki` state directory, provider/token/reasoning settings, and secret sanitization | [Configuration and Environment](./operations/configuration.md) |
+| Override a hosted provider base URL — for example, retarget OpenRouter at a regional endpoint via `OPENROUTER_BASE_URL` (overridable alongside each provider's key; `--debug` OpenRouter request capture follows the overridden URL) | [Model Providers and Credentials](./concepts/model-providers.md) and [Configuration and Environment](./operations/configuration.md) |
+| Set up scheduled self-update in CI and the docs-PR workflow                                  | [CI Scheduling and Self-Update](./operations/ci-scheduling.md) |
 
 ### Integrate with other tools
 
 | I want to…                                                                  | Read                                             |
 | --------------------------------------------------------------------------- | ------------------------------------------------ |
-| Run OpenWiki inside IBM Bob, Codex, Claude Code, OpenCode, Cursor, Kiro, Oh My Pi, or Antigravity CLI | [Coding-Agent Integrations](/openwiki/integrations/coding-agents.md) |
-| Understand the built-in source connectors, the ConnectorRuntime contract, and how to add a new one | [Source Connectors](/openwiki/integrations/connectors.md) |
-| Explore the interactive graph visualizer (live server and static export)    | [Interactive Visualizer](/openwiki/integrations/visualizer.md) |
+| Run OpenWiki inside IBM Bob, Codex, Claude Code, OpenCode, Cursor, Kiro, Oh My Pi, Antigravity CLI, or GitHub Copilot CLI | [Coding-Agent Integrations](./integrations/coding-agents.md) |
+| Understand the built-in source connectors, the ConnectorRuntime contract, and how to add a new one | [Source Connectors](./integrations/connectors.md) |
+| Explore the interactive graph visualizer (live server and static export)    | [Interactive Visualizer](./integrations/visualizer.md) |
 
 ### Test your changes
 
 | I want to…                                                | Read                                           |
 | --------------------------------------------------------- | ---------------------------------------------- |
-| Understand the test layout and how to run and scope tests | [Testing Guide](/openwiki/testing/overview.md) |
-| Understand the LEDGER longitudinal evaluation framework and DeepSWE evaluation harness | [Evaluation Systems](/openwiki/testing/evals.md) |
+| Understand the test layout and how to run and scope tests | [Testing Guide](./testing/overview.md) |
+| Understand the LEDGER longitudinal evaluation framework and DeepSWE evaluation harness | [Evaluation Systems](./testing/evals.md) |
 
 ## Where OpenWiki keeps its state
 
@@ -220,6 +244,15 @@ their workspace is preserved. An update whose Claims preflight is clean, source
 fingerprint is unchanged, and every existing page has complete baseline coverage
 is proven a strict no-op at `begin` time and skips model invocation.
 
+For a focused update, `openwiki_submit_plan` may set
+`deferUnplannedClaimIssues: true`. With that flag the planner omits unplanned
+pages that carry only stale or unresolved Claim issues — those
+`deferredClaimPages` are left untouched this run rather than forced into the
+plan, so a later full update reconciles them. Finalization excludes deferred-claim
+pages from the durable Claims proof and the source-checkpoint restamp, so the
+run still `finish`es with `interrupted` metadata until a full update reclaims
+them.
+
 By default a native run documents one page per worker. Set
 `OPENWIKI_PAGE_CONCURRENCY` to an integer from `1` to `8` (default `1`) to run
 that many page workers at once; each worker still owns exactly one page, the
@@ -228,8 +261,8 @@ task-routing map links to pages that exist, and every page remains a durable
 resume unit. A worker that fails on a provider rate limit lowers the live
 concurrency by one (never below `1`) and restores its page for the next run.
 For worker-scaling, retry, and output-token details see
-[Repository Generation Lifecycle](/openwiki/workflows/repository-generation.md)
-and [Configuration and Environment](/openwiki/operations/configuration.md).
+[Repository Generation Lifecycle](./workflows/repository-generation.md)
+and [Configuration and Environment](./operations/configuration.md).
 
 Finalization is deterministic and runs once. `finishRepositoryRun` refuses to
 finish while any page job is still `pending`, validates that every `skipped` job
@@ -247,8 +280,8 @@ follow-up `openwiki --update` to reconcile the drift.
 ## Host-driven generation
 
 OpenWiki can also run inside a host coding agent — IBM Bob, Codex, Claude Code,
-OpenCode, Cursor, Kiro, Oh My Pi (`omp`), or Antigravity CLI (`antigravity`) —
-instead of launching its own model. The integration shares one canonical skill
+OpenCode, Cursor, Kiro, Oh My Pi (`omp`), Antigravity CLI (`antigravity`), or
+GitHub Copilot CLI (`copilot`) — instead of launching its own model. The integration shares one canonical skill
 and the same six MCP operations as native generation:
 `openwiki_begin`, `openwiki_submit_plan`, `openwiki_next_page`, optional on-demand
 `openwiki_inspect_page_claims`, `openwiki_submit_page`, and `openwiki_finish`. The
@@ -257,10 +290,21 @@ durable queue, Claims reconciliation, source-drift handling, and deterministic
 finalization. Host-driven runs currently support repository code wikis (not
 personal brains), use the host's authenticated model session, and use repository
 source and tests only — connector context (including LangSmith) is not yet
-supported. The host submits only sparse Claim decisions for each page
+supported. An unrecognized `language` fails `openwiki_begin` with `invalid_input`
+instead of starting a run. `openwiki_begin` returns bounded `changedPaths` and
+per-update-window path lists capped at 200 paths, plus `claimIssues` capped at 50,
+but keeps the totals exact: `changedPathCount` and `claimIssueCount` are the true
+counts, and `claimIssuePages` names every page with a Claims issue even when its
+issue is omitted. When `changedPathsTruncated` is set the host recovers the rest
+from its own Git (`git diff --name-only <baseGitHead>..HEAD` on a non-fullReview
+window, plus `git diff --name-only HEAD` and
+`git ls-files --others --exclude-standard`, omitting `openwiki/` and
+`.openwikiignore` paths); a truncated per-window list likewise recovers from Git,
+and a truncated `claimIssues` list is still fully covered by `claimIssuePages`.
+The host submits only sparse Claim decisions for each page
 (`confirmedClaimIds` for rechecked issue Claims kept unchanged, `claims` for
 revisions and additions, `retractedClaimIds` for removals); OpenWiki
 automatically retains current issue-free Claims and makes the full Claim set
 available through on-demand `openwiki_inspect_page_claims` for broad rewrites.
-See [Coding-Agent Integrations](/openwiki/integrations/coding-agents.md) for
+See [Coding-Agent Integrations](./integrations/coding-agents.md) for
 install scope, the host registry, and the host-driven lifecycle boundary.

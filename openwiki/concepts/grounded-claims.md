@@ -1,7 +1,7 @@
 ---
 type: concept
 title: Grounded Claims
-description: How OpenWiki grounds generated wiki pages in versioned repository evidence through the Claims model, including the store, session, and runtime split, evidence resolution and staleness detection, sparse page-completion reconciliation, on-demand full-Claim inspection, and the durability boundary reached at page completion.
+description: How OpenWiki grounds generated wiki pages in versioned repository evidence through the Claims model, including the store, session, and runtime split, evidence resolution and staleness detection, sparse page-completion reconciliation, on-demand full-Claim inspection, deferred Claim pages, and the durability boundary reached at page completion.
 tags: [claims, evidence, grounding, provenance, verification, repository, okf]
 sources:
   - id: openwiki-source-8b316b2a9d744597bffd9c56
@@ -32,8 +32,12 @@ sources:
     resource: repo://src/claims/guidance.ts
   - id: openwiki-source-1197594de038075f3570340c
     resource: repo://src/generation/page-jobs.ts
+  - id: openwiki-source-674d6e5badef7368ab04f064
+    resource: repo://src/generation/page-manifest.ts
   - id: openwiki-source-7c5ecb56558cc061dab24f9d
     resource: repo://src/generation/repository-run.ts
+  - id: openwiki-source-080c4525024a9b689e361cbb
+    resource: repo://src/generation/run-state.ts
   - id: openwiki-source-58835b77ce38a0dd1fed8d09
     resource: repo://src/integrations/core/session-manager.ts
   - id: openwiki-source-eab9328975981f427c4218d0
@@ -42,10 +46,10 @@ sources:
     resource: repo://src/okf/claim-sources.ts
   - id: openwiki-source-95484b6dcd037757691dcbb2
     resource: repo://src/okf/claims-verification.ts
-generated: { by: "openwiki/0.5.2", at: "2026-09-23T08:09:37.122Z" }
+generated: { by: "openwiki/0.9.0", at: "2026-11-06T08:06:02.348Z" }
 verified:
-  - by: openwiki/0.5.2
-    at: 2026-09-23T08:09:37.122Z
+  - by: openwiki/0.9.0
+    at: 2026-11-06T08:06:02.348Z
 ---
 
 # Grounded Claims
@@ -84,6 +88,18 @@ working state, and lifecycle orchestration into three cooperating layers.
   exposes a single `finalize` entrypoint that persists Claims and synchronizes
   OKF projections.
 
+`buildClaimsRuntime` is the factory that binds a `ClaimSession` to its
+`ClaimsStore` and implements `ClaimsRuntime.finalize`. Finalize is a two-stage
+operation: it first calls `session.finalize` to persist dirty Claim state and
+derive durable verification eligibility per page, then calls
+`finalizeVerificationProjection` to project those stamps into OKF front matter
+through `synchronizeClaimsVerification`. The projection stage refreshes every
+represented page's `pageVersion` after projection and rolls back any newly
+exposed verification stamp whose hash could not be refreshed, so a stamp never
+outlives an accurate `pageVersion`. Both stages forward `excludedPages`, and
+the runtime treats any warning from either as a strict `ClaimsPersistenceError`,
+so an incomplete finalization cannot pass silently.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Persisted
@@ -107,7 +123,8 @@ stateDiagram-v2
 
 Claim lifecycle and state transitions from persisted sidecar through preflight
 classification, reconciliation, and durable finalization. An `Excluded` page is
-one passed in `finalize`'s `excludedPages` set and is left untouched.
+one passed in `finalize`'s `excludedPages` set — a formally skipped page or a
+deferred Claim page — and is left untouched.
 
 ## Where Claim state persists
 
@@ -153,6 +170,30 @@ the content did not actually change.
 Because versions are content-derived, a version mismatch is exactly a content
 change. Resolution returns `null` when a file or range no longer exists, which is
 distinct from a version that merely changed.
+
+```mermaid
+flowchart TD
+    A["resolve repo:// path with priorVersion"] --> B{"whole-file or range?"}
+    B -- "whole-file" --> C["hash entire file"]
+    C --> D["return repo-file-v1:sha256"]
+    B -- "line range" --> E{"prior version parseable?"}
+    E -- "no" --> F["use URI line hint as span"]
+    E -- "yes" --> G["try content hash at hinted span"]
+    G --> H{"exact content match?"}
+    H -- "yes, unique" --> I["return prior version unchanged"]
+    H -- "no or ambiguous" --> J["relocate by first and last line hashes"]
+    J --> K{"unique anchor match?"}
+    K -- "yes" --> L["return prior version at relocated span"]
+    K -- "no" --> M["relocate between surrounding context hashes"]
+    M --> N{"unique span?"}
+    N -- "yes" --> O["new span, new version"]
+    N -- "no" --> P["return null unresolved"]
+    F --> O
+```
+
+Line-range evidence resolution and relocation. The resolver prefers an exact
+content-hash match at the hinted span, then relocation by selected-line hashes,
+then relocation by surrounding context hashes; ambiguity resolves to `null`.
 
 ## Staleness and unresolved detection
 
@@ -252,10 +293,11 @@ focused updates that touch only issue-bearing Claims need not call it.
 
 `ClaimSession.finalize` is the boundary where run-scoped Claim state becomes
 durable. It accepts an `excludedPages` set — pages whose generation jobs were
-skipped during an interrupted run — and leaves those pages untouched: it neither
-persists, rechecks, nor deletes their sidecars. For every other page, finalization
-only touches pages that actually changed, and each such page must pass two gates
-before its sidecar is written:
+skipped during an interrupted run, or pages whose Claim issues were deferred
+(see below) — and leaves those pages untouched: it neither persists, rechecks,
+nor deletes their sidecars. For every other page, finalization only touches
+pages that actually changed, and each such page must pass two gates before its
+sidecar is written:
 
 1. **No evidence debt** — a page with unresolved grounding issues is refused, so
    stale or unresolved Claims cannot be silently persisted as verified.
@@ -264,8 +306,10 @@ before its sidecar is written:
    accepted, the page is not persisted.
 
 The runtime exposes this through `ClaimsRuntime.finalize(at, excludedPages)`,
-which builds the OpenWiki producer verification event and forwards the skipped
-set.
+which delegates to `session.finalize` for Claims persistence and then to
+`finalizeVerificationProjection` (built on `synchronizeClaimsVerification`) for
+OKF stamp projection and page-hash refresh, forwarding the excluded set to both
+stages so skipped and deferred pages are never touched.
 
 ### Per-page proof at `submit_page`
 
@@ -276,11 +320,13 @@ then takes the lock so concurrent workers never lose each other's
 completions: `reconcilePageClaims` translates the model's sparse Claim
 decisions into the complete `confirm` / `update` / `add` / `retract`
 operation batch the session expects, then `claimsRuntime.finalize` persists
-the dirty page — excluding every other still-pending page, which a concurrent
-worker may be mid-edit on, so projecting a stamp or rehashing their sidecar
-here would record transient bytes — and finally `assertPageClaimsDurable`
-re-opens the freshly written sidecar and proves the page is durable before
-the job is marked complete and the queue advances.
+the dirty page — excluding every other still-pending page plus every page in the
+plan's `deferredClaimPages` set, since a concurrent worker may be mid-edit on a
+pending page and a deferred page must keep its prior verification and source
+checkpoint, so projecting a stamp or rehashing their sidecar here would record
+transient bytes — and finally `assertPageClaimsDurable` re-opens the freshly
+written sidecar and proves the page is durable before the job is marked complete
+and the queue advances.
 
 `assertPageClaimsDurable` is the strict per-page proof. It re-reads the sidecar
 from disk and refuses the page when any of the following fail, so a partially or
@@ -300,16 +346,56 @@ The whole-run proof waits until every page job is complete (see below); the
 per-page proof lets `submit_page` fail fast and request a retry before the queue
 moves on.
 
+### Worker failure recovery: snapshot, restore, and skip
+
+Before a bounded page worker starts model-owned work, `captureRepositoryPageSnapshot`
+records the page's pre-run Markdown **and** its Claims sidecar together. On
+failure the snapshot is replayed by `restoreRepositoryPage`, which writes the
+Markdown back through the backend and restores the sidecar through the store —
+writing the captured `PageClaims` when one existed, or deleting the sidecar when
+the page had none — so a failed attempt cannot leave Markdown and Claims out of
+sync.
+
+When a page is finally given up on, `skipRepositoryPage` runs that restore under
+the run mutation lock, then rebuilds the entire `ClaimsRuntime` from disk so the
+shared session reflects the rolled-back sidecar, marks the job `skipped`, and
+records an `interrupted` update. Because the runtime is rebuilt from durable
+sidecars, a concurrent worker's already-durable completion cannot be lost, and
+the skipped page's pre-run Claim state is the state later exempted at finish.
+
+### Deferred Claim pages
+
+An update run can intentionally defer unplanned Claim work. When the plan sets
+`deferUnplannedClaimIssues`, the planner does **not** insert the required
+reconciliation jobs for stale or unresolved Claims that surfaced in preflight.
+Instead, the pages carrying those unplanned issues — after excluding any already
+in the plan or marked for deletion — are collected into the plan's
+`deferredClaimPages` set (an `init` run may not defer, since init starts from
+empty Claim state and has no unplanned issues to defer). Deferral preserves those
+pages' prior verification stamp and source checkpoint rather than forcing a
+full reconciliation pass in the current run; a later full update revisits them.
+
+Deferred pages are treated like skipped pages for Claims finalization. At
+`submit_page`, every page in `deferredClaimPages` is added to the
+`otherPendingPages` exclusion set alongside other still-pending jobs, so the
+current page's finalize never projects a stamp onto or rehashes a deferred
+page. At `finishRepositoryRun`, `deferredClaimPages` are folded into
+`skippedPages` together with the formally skipped jobs, so they are exempt from
+Claims persistence and from the "no orphan sidecar" / "every claimed page is
+durable" checks, and they keep their prior source checkpoint in the page
+manifest.
+
 ### Finishing a run: skipped pages and the whole-run proof
 
 When a repository run finishes, `finishRepositoryRun` first validates that every
 skipped page job carries its original `captureRepositoryPageSnapshot` capture,
 refusing to finish if any skipped job is missing its snapshot or its path no
-longer matches the job. It then derives `skippedPages` from the skipped jobs and
-passes the set both to `finalize` and to the post-run durability assertion
-(`assertRepositoryClaimsDurable`), so skipped pages are exempt from Claims
-persistence and from the "no orphan sidecar" / "every claimed page is durable"
-checks that gate the run.
+longer matches the job. It then derives `skippedPages` from the skipped jobs —
+unioning in the plan's `deferredClaimPages` so deferred Claim pages are exempt
+alongside formally skipped ones — and passes the set both to `finalize` and to
+the post-run durability assertion (`assertRepositoryClaimsDurable`), so skipped
+and deferred pages are exempt from Claims persistence and from the
+"no orphan sidecar" / "every claimed page is durable" checks that gate the run.
 
 Finalization also removes orphaned sidecars (whose pages no longer exist),
 deletes sidecars for pages whose Markdown vanished during the run, and removes
@@ -347,8 +433,9 @@ for a machine stamp.
 The projection can rewrite code-owned front matter, which changes the Markdown
 bytes and therefore the page hash. To keep sidecars consistent with the final
 bytes, `refreshPageVersions` re-hashes represented pages after projection; if a
-page whose stamp was newly exposed cannot be refreshed, the verification stamp is
-rolled back so a stamp never outlives an accurate `pageVersion`.
+page whose stamp was newly exposed cannot be refreshed, `finalizeVerificationProjection`
+rolls the verification stamp back through `rollbackClaimsVerification` so a
+stamp never outlives an accurate `pageVersion`.
 
 ## Preparation, resolver caching, and configuration
 
@@ -394,13 +481,20 @@ for every `init` / `update` job, so a worker authoring a page sees the full
 substance and reconciliation standard. The MCP server `INSTRUCTIONS` constant
 inlines only `CLAIMS_RECONCILIATION_GUIDANCE` (the host already drives page
 authoring through `openwiki_submit_page`, whose tool description carries the
-sparse-decision rules), alongside workspace-discovery guidance and the
-deterministic page-job lifecycle, so the same reconciliation rules reach every
-MCP host integration and tool description.
+sparse-decision rules), alongside workspace-discovery guidance, the
+deterministic page-job lifecycle, and a **begin-view recovery / Claims-issue
+surface** for update runs: when `begin` returns `changedPathsTruncated` the host
+recovers the remaining changed paths itself with `git diff --name-only
+<baseGitHead>..HEAD` (and the uncommitted variants), and `claimIssuePages`
+names every page carrying a Claims issue, which OpenWiki adds to the plan and
+which `openwiki_next_page` then enumerates for attention. So the same
+reconciliation rules reach every MCP host integration and tool description, with
+enough of the begin-view surface for a host to build a complete plan without
+OpenWiki enumerating every changed path up front.
 
 ## Related pages
 
-- [Source Map](/openwiki/architecture/source-map.md)
-- [OKF Output](/openwiki/concepts/okf-output.md)
-- [Claims Reconciliation](/openwiki/workflows/claims-reconciliation.md)
-- [Repository Generation](/openwiki/workflows/repository-generation.md)
+- [Source Map](../architecture/source-map.md)
+- [OKF Output](./okf-output.md)
+- [Claims Reconciliation](../workflows/claims-reconciliation.md)
+- [Repository Generation](../workflows/repository-generation.md)

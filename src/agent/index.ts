@@ -11,7 +11,11 @@ import { ChatOpenAI } from "@langchain/openai";
 import { ChatOpenRouter } from "@langchain/openrouter";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import type { Event as ProtocolEvent } from "@langchain/protocol";
-import { createDeepAgent, createFilesystemMiddleware } from "deepagents";
+import {
+  createDeepAgent,
+  createFilesystemMiddleware,
+  type DeepAgent,
+} from "deepagents";
 import { createOpenWikiConnectorTools } from "../connectors/tools.js";
 import {
   DEBUG_ENV_KEYS,
@@ -50,6 +54,7 @@ import {
   refreshChatGptTokens,
 } from "./openai-chatgpt-oauth.js";
 import { createBobFetch } from "./bob.js";
+import { createEntraTokenProvider } from "./entra-auth.js";
 import { createSystemPrompt, createUserPrompt } from "./prompt.js";
 import { syncBundledSkills } from "./skills.js";
 import {
@@ -94,6 +99,7 @@ import {
   getProviderModelOptions,
   FIREWORKS_BASE_URL_ENV_KEY,
   getProviderRegionEnvKeys,
+  MISTRAL_BASE_URL_ENV_KEY,
   getProviderSecretKeyEnvKey,
   getProvidersForKnownModelId,
   isModelIdForOtherProvider,
@@ -103,10 +109,13 @@ import {
   normalizeModelId,
   NVIDIA_BASE_URL_ENV_KEY,
   OPENAI_BASE_URL_ENV_KEY,
+  OPENAI_COMPATIBLE_AUTH_ENV_KEY,
   OPENAI_COMPATIBLE_BASE_URL_ENV_KEY,
+  OPENAI_COMPATIBLE_ENTRA_SCOPE_ENV_KEY,
   OPENAI_COMPATIBLE_STREAMING_ENV_KEY,
   OPENROUTER_API_KEY_ENV_KEY,
   OPENROUTER_BASE_URL,
+  OPENROUTER_BASE_URL_ENV_KEY,
   OPENWIKI_MAX_OUTPUT_TOKENS_ENV_KEY,
   OPENWIKI_MODEL_ID_ENV_KEY,
   OPENWIKI_OPENROUTER_MAX_TOKENS_ENV_KEY,
@@ -117,12 +126,14 @@ import {
   providerRequiresRegion,
   providerRequiresSecretKey,
   providerUsesAwsSdkCredentials,
+  providerUsesEntraId,
   providerUsesExternalCliAuth,
   providerUsesResponsesApi,
   providerUsesStreaming,
   resolveConfiguredMaxOutputTokens,
   resolveConfiguredProvider,
   resolveOpenAiCompatibleStreamMessages,
+  resolveOpenAICompatibleEntraScope,
   resolveOpenRouterMaxTokens,
   resolveOpenRouterProviderOnly,
   resolveProviderBaseUrl,
@@ -404,7 +415,7 @@ export type OpenWikiAgentOptions = {
  */
 export async function createOpenWikiAgent(
   options: OpenWikiAgentOptions,
-): Promise<ReturnType<typeof createDeepAgent>> {
+): Promise<DeepAgent> {
   if (!path.isAbsolute(options.cwd)) {
     throw new Error("OpenWiki agent cwd must be an absolute path.");
   }
@@ -462,7 +473,7 @@ type OpenWikiAgentGraphOptions = OpenWikiAgentOptions & {
 
 function createOpenWikiAgentGraph(
   options: OpenWikiAgentGraphOptions,
-): ReturnType<typeof createDeepAgent> {
+): DeepAgent {
   const wikiBackend = new OpenWikiLocalShellBackend({
     docsOnly: options.command !== "chat",
     openWikiIgnore: options.openWikiIgnore,
@@ -1117,6 +1128,17 @@ export function createModel(
   maxOutputTokens?: number,
   streamIdleTimeout?: number,
 ) {
+  if (provider === "mistral") {
+    if (!getProviderApiKey(provider)?.trim()) {
+      throw new Error("MISTRAL_API_KEY is required for the Mistral provider.");
+    }
+    if (process.env.OPENAI_CUSTOM_HEADERS?.trim()) {
+      throw new Error(
+        "Remove OPENAI_CUSTOM_HEADERS when using the Mistral provider.",
+      );
+    }
+  }
+
   const retryOptions = { maxRetries: providerRetryAttempts };
   const configuredMaxOutputTokens =
     maxOutputTokens ?? resolveConfiguredMaxOutputTokens(provider);
@@ -1206,6 +1228,12 @@ export function createModel(
       apiKey: getProviderApiKey(provider),
       ...(baseURL ? { anthropicApiUrl: baseURL } : {}),
       ...(maxTokens !== undefined ? { maxTokens } : {}),
+      // The Anthropic SDK rejects non-streaming requests whose max_tokens
+      // implies more than 10 minutes (above ~21,333 tokens) before sending
+      // them, which caps OPENWIKI_MAX_OUTPUT_TOKENS well below the models'
+      // real output limits (issue #1046). Streaming has no such guard, and
+      // ChatAnthropic still returns one aggregated message from `.invoke()`.
+      streaming: true,
       ...retryOptions,
     });
   }
@@ -1255,7 +1283,7 @@ export function createModel(
 
     return new ChatOpenRouter({
       apiKey: process.env[OPENROUTER_API_KEY_ENV_KEY],
-      baseURL: OPENROUTER_BASE_URL,
+      baseURL: resolveProviderBaseUrl(provider),
       model: modelId,
       ...(effectiveMaxTokens !== undefined
         ? { maxTokens: effectiveMaxTokens }
@@ -1306,10 +1334,17 @@ export function createModel(
   }
 
   return new ChatOpenAI({
-    apiKey: getProviderApiKey(provider),
+    apiKey: providerUsesEntraId(provider)
+      ? createEntraTokenProvider(baseURL, resolveOpenAICompatibleEntraScope())
+      : getProviderApiKey(provider),
     configuration,
     model: modelId,
     useResponsesApi: chatOpenAiUsesResponsesApi,
+    // OpenAI-compatible gateways may treat omitted strict mode differently.
+    // These tools use optional fields, so preserve their non-strict semantics.
+    ...(provider === "openai-compatible"
+      ? { supportsStrictToolCalling: false }
+      : {}),
     ...maxTokensOptions,
     ...responsesReasoningOptions,
     ...chatCompletionsReasoningOptions,
@@ -1564,6 +1599,9 @@ function createGeminiEnterpriseModel(
               }),
           ),
         ...(maxTokens !== undefined ? { maxTokens } : {}),
+        // Same non-streaming max_tokens guard as the direct Anthropic provider
+        // (AnthropicVertex shares the SDK's Messages resource); see #1046.
+        streaming: true,
         ...retryOptions,
       });
     }
@@ -2152,8 +2190,11 @@ type OpenRouterRequestSummary = {
 type OpenRouterResponseSummary = {
   bodyPreview: string;
   headers: Record<string, string>;
+  malformedReason?: string;
   status: number;
   statusText: string;
+  upstreamStatus?: number;
+  upstreamStatusText?: string;
 };
 
 const OPENROUTER_DEBUG_PROPERTY = "openRouterDebug";
@@ -2206,6 +2247,41 @@ function openRouterDebugFetch(
       while (true) {
         const response = await baseFetch(input, init);
 
+        if (response.ok && request.stream === false) {
+          const malformedResponse =
+            await createMalformedOpenRouterResponse(response);
+
+          if (malformedResponse) {
+            const body = await readResponseBody(response);
+            const failure: OpenRouterFetchFailure = {
+              request,
+              response: {
+                bodyPreview: body.preview,
+                headers: getSafeResponseHeaders(response.headers),
+                malformedReason: malformedResponse.reason,
+                status: malformedResponse.response.status,
+                statusText: malformedResponse.response.statusText,
+                upstreamStatus: response.status,
+                upstreamStatusText: response.statusText,
+              },
+            };
+            recordFailure(failure);
+            for (const sink of activeOpenRouterSinks) {
+              emitDebug(
+                sink.options,
+                `openrouter.http status=${malformedResponse.response.status} statusText=${JSON.stringify(
+                  malformedResponse.response.statusText,
+                )} upstreamStatus=${response.status} malformed=${JSON.stringify(
+                  malformedResponse.reason,
+                )}`,
+              );
+            }
+
+            await response.body?.cancel().catch(() => undefined);
+            return malformedResponse.response;
+          }
+        }
+
         if (!response.ok) {
           const body = await readResponseBody(response);
           const failure: OpenRouterFetchFailure = {
@@ -2257,6 +2333,109 @@ function openRouterDebugFetch(
       throw error;
     }
   })();
+}
+
+async function createMalformedOpenRouterResponse(
+  response: Response,
+): Promise<{ reason: string; response: Response } | null> {
+  let body: unknown;
+
+  try {
+    body = await response.clone().json();
+  } catch {
+    return {
+      reason: "invalid_json",
+      response: createOpenRouterMalformedSuccessResponse(
+        response,
+        "the response body was not valid JSON",
+      ),
+    };
+  }
+
+  const reason = getMalformedOpenRouterChatCompletionReason(body);
+
+  if (reason === null) {
+    return null;
+  }
+
+  return {
+    reason,
+    response: createOpenRouterMalformedSuccessResponse(
+      response,
+      describeMalformedOpenRouterReason(reason),
+    ),
+  };
+}
+
+function getMalformedOpenRouterChatCompletionReason(
+  body: unknown,
+): string | null {
+  if (!isRecord(body)) {
+    return "root_not_object";
+  }
+
+  if (!Array.isArray(body.choices) || body.choices.length === 0) {
+    return "missing_choices";
+  }
+
+  const firstChoice: unknown = body.choices[0];
+
+  if (!isRecord(firstChoice)) {
+    return "first_choice_not_object";
+  }
+
+  if (!isRecord(firstChoice.message)) {
+    return "missing_choices_0_message";
+  }
+
+  return null;
+}
+
+function describeMalformedOpenRouterReason(reason: string): string {
+  switch (reason) {
+    case "root_not_object":
+      return "the JSON root was not an object";
+    case "missing_choices":
+      return "choices was missing or empty";
+    case "first_choice_not_object":
+      return "choices[0] was not an object";
+    case "missing_choices_0_message":
+      return "choices[0].message was missing or not an object";
+    default:
+      return reason;
+  }
+}
+
+function createOpenRouterMalformedSuccessResponse(
+  upstreamResponse: Response,
+  detail: string,
+): Response {
+  const headers = new Headers({ "content-type": "application/json" });
+
+  for (const [key, value] of Object.entries(
+    getSafeResponseHeaders(upstreamResponse.headers),
+  )) {
+    headers.set(key, value);
+  }
+
+  return new Response(
+    JSON.stringify({
+      error: {
+        code: 502,
+        message: `OpenRouter returned a malformed successful non-streaming chat completion response: ${detail}.`,
+        metadata: {
+          openwiki_reason: "malformed_success_response",
+          upstream_status: upstreamResponse.status,
+          upstream_status_text: upstreamResponse.statusText,
+        },
+      },
+    }),
+    {
+      headers,
+      status: 502,
+      statusText: "Bad Gateway",
+    },
+  );
 }
 
 /**
@@ -2390,7 +2569,9 @@ function isOpenRouterFetchInput(input: Parameters<typeof fetch>[0]): boolean {
 
   return (
     url !== null &&
-    url.startsWith(OPENROUTER_BASE_URL) &&
+    url.startsWith(
+      resolveProviderBaseUrl("openrouter") ?? OPENROUTER_BASE_URL,
+    ) &&
     url.includes("/chat/completions")
   );
 }
@@ -2591,9 +2772,11 @@ export function formatEnvironmentDebugValue(
     key === BASETEN_BASE_URL_ENV_KEY ||
     key === COPILOT_BASE_URL_ENV_KEY ||
     key === FIREWORKS_BASE_URL_ENV_KEY ||
+    key === MISTRAL_BASE_URL_ENV_KEY ||
     key === NVIDIA_BASE_URL_ENV_KEY ||
     key === OPENAI_BASE_URL_ENV_KEY ||
-    key === OPENAI_COMPATIBLE_BASE_URL_ENV_KEY
+    key === OPENAI_COMPATIBLE_BASE_URL_ENV_KEY ||
+    key === OPENROUTER_BASE_URL_ENV_KEY
   ) {
     return formatUrlDebugValue(value);
   }
@@ -2614,6 +2797,8 @@ export function formatEnvironmentDebugValue(
     key === OPENWIKI_STREAM_IDLE_TIMEOUT_ENV_KEY ||
     key === OPENWIKI_PROVIDER_RETRY_ATTEMPTS_ENV_KEY ||
     key === OPENWIKI_OPENROUTER_MAX_TOKENS_ENV_KEY ||
+    key === OPENAI_COMPATIBLE_AUTH_ENV_KEY ||
+    key === OPENAI_COMPATIBLE_ENTRA_SCOPE_ENV_KEY ||
     key === OPENAI_COMPATIBLE_STREAMING_ENV_KEY ||
     key === BEDROCK_AWS_REGION_ENV_KEY
   ) {

@@ -30,10 +30,18 @@ sources:
     resource: repo://src/connectors/tools.ts
   - id: openwiki-source-c6189f89b3f67d0cbf87739f
     resource: repo://src/ingestion/ingestion.ts
-generated: { by: "openwiki/0.5.2", at: "2026-09-23T08:09:37.122Z" }
+  - id: openwiki-source-ada7fcb0bef11e183302d637
+    resource: repo://src/integrations/core/begin-view.ts
+  - id: openwiki-source-3c86ca0bb7fbb79f2be66a2b
+    resource: repo://src/integrations/core/retrieval-tools.ts
+  - id: openwiki-source-58835b77ce38a0dd1fed8d09
+    resource: repo://src/integrations/core/session-manager.ts
+  - id: openwiki-source-eab9328975981f427c4218d0
+    resource: repo://src/integrations/mcp/server.ts
+generated: { by: "openwiki/0.7.3", at: "2026-11-04T08:06:10.698Z" }
 verified:
-  - by: openwiki/0.5.2
-    at: 2026-09-23T08:09:37.122Z
+  - by: openwiki/0.7.3
+    at: 2026-11-04T08:06:10.698Z
 ---
 
 # Code vs Personal Modes
@@ -91,8 +99,9 @@ There are two ways to request a non-default mode:
 - **Positional mode word.** A mode word in the first positional slot selects the
   mode even when flags precede it (for example `openwiki --print code --update`).
   This positional handling is deliberate: without it the mode word would be
-  treated as the user message and the run would silently target the default
-  personal-style wiki.
+  swallowed into the user message and the run would silently keep the default
+  `code` mode — so `openwiki --print personal --update` would update the
+  repository wiki instead of the personal brain.
 - **`--mode <personal|code>` flag.** The flag (and its `--mode=` form) validates
   the value and sets the mode with source `option`. An unrecognized value fails
   with `Invalid mode: ...`.
@@ -166,9 +175,28 @@ apply to code repository wikis only:
   `outputMode === "repository"`.
 - **Host-driven (coding-agent) runs.** Running OpenWiki inside Codex, Claude
   Code, OpenCode, and the other registered coding agents currently supports
-  repository code wikis only, not personal brains, and uses only repository
-  source and tests as context; connector-sourced context (including LangSmith)
-  is not yet supported in that path.
+  repository code wikis only, not personal brains. The MCP lifecycle the host
+  drives (`openwiki_begin` → `openwiki_submit_plan` → `openwiki_next_page` →
+  `openwiki_submit_page` → `openwiki_finish`) operates on a resolved Git
+  repository root and `openwiki/`, exposes read-only repository-wiki retrieval
+  plus the page-job generation queue, and never hands the host the connector
+  ingestion tools. The host researches the repository with its own native
+  tools, so connector-sourced context (including LangSmith) is not yet
+  supported in that path.
+
+  The `openwiki_begin` result returned to a host is explicitly bounded so large
+  lists do not overwhelm the host context: `toHostActiveBeginView` caps the top
+  changed-path list and each update window's path list (at
+  `HOST_BEGIN_PATH_LIMIT`, shared across windows) and the Claims-issue list (at
+  `HOST_BEGIN_CLAIM_ISSUE_LIMIT`) while preserving the exact totals in
+  `changedPathCount` and `claimIssueCount`, sets `changedPathsTruncated` /
+  `claimIssuesTruncated` flags, and lists every page with a Claims issue in
+  `claimIssuePages`. The MCP server's `INSTRUCTIONS` tell the host to recover
+  omitted paths with its own Git (`git diff --name-only <baseGitHead>..HEAD`,
+  `git diff --name-only HEAD`, and `git ls-files --others --exclude-standard`,
+  excluding `openwiki/` and `.openwikiignore`), and rely on
+  `openwiki_next_page` for each page's Claims. Planning and page jobs read the
+  run's own in-process state, so a bounded host view loses no required work.
 
 ## Capabilities that apply to personal mode only
 
@@ -218,7 +246,7 @@ whichever home directory is in effect.
 
 ## Related pages
 
-- [Architecture overview](/openwiki/architecture/overview.md)
-- [Configuration](/openwiki/operations/configuration.md)
-- [Personal ingestion workflow](/openwiki/workflows/personal-ingestion.md)
-- [Repository generation workflow](/openwiki/workflows/repository-generation.md)
+- [Architecture overview](../architecture/overview.md)
+- [Configuration](../operations/configuration.md)
+- [Personal ingestion workflow](../workflows/personal-ingestion.md)
+- [Repository generation workflow](../workflows/repository-generation.md)
